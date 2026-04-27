@@ -1,0 +1,36 @@
+# Byte-compiled / cache
+.DS_Store
+__pycache__/
+*.py[codz]
+*.so
+
+# Local DB + WAL
+*.db
+*.db-shm
+*.db-wal
+
+# Env / secrets
+# .env is a symlink to ../statalyzer/.env — both ignored, but symlink itself
+# stays out of git so a fresh clone doesn't ship a broken pointer.
+.env
+.env.*
+*.key
+*.json.key
+leeroy-mainnet.json
+
+# Virtualenvs
+.venv
+venv/
+env/
+
+# Editor
+.vscode/
+.idea/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
