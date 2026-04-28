@@ -1,19 +1,26 @@
-"""Makerator main loop.
+"""Makerator main loop — event-driven over Yellowstone Geyser gRPC.
 
-Conducts each tick:
-  prices → signals → fetch books → quoter → orders.reconcile
-  → per-market BatchUpdate (cancels + places) → SwQOS submit
-  → poll signature → parse program return data → register placed orders
+Three concurrent tasks share state:
+  book_listener   — gRPC stream of the 5 Manifest market accounts.
+                    On each update: parse book, compute LST/SOL ratio
+                    midpoint, push to SignalGenerator, trigger eval.
+  fill_listener   — gRPC stream of our wallet's transactions (live mode only).
+                    Triggers eval so book-derived fill detection runs ASAP.
+  ttl_timer       — fires eval every N seconds even when the book is quiet,
+                    so TTL-driven cancels happen.
+
+Eval is serialized via asyncio.Lock so concurrent events don't double-quote.
 
 Modes:
-  --dry-run (default)  print what it would do, no chain writes
+  --dry-run (default)  print what eval decides, no chain writes
   --live               actually build, submit, register
 
 Safety:
   - Default is dry-run; --live must be explicit.
-  - On startup, prints a summary and waits for confirm unless --no-confirm.
-  - Bootstrap from chain on startup (walks seats trees + filters resting
-    orders by trader_index) so a crash/restart reconstructs open orders.
+  - Bootstrap from chain on startup (walks seats + filters resting orders
+    by trader_index) so a crash/restart reconstructs open orders.
+  - Drops Jupiter polling: prices are derived from Manifest book midpoints
+    (cointegration spread is anchor-invariant; ratio works as the price).
 """
 import argparse
 import asyncio
@@ -36,12 +43,15 @@ from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
 from config import Config
-from price_feed import JupiterPriceFeed
+from db import Database
 from signals import SignalGenerator
 import manifest
 import quoter
 import orders
 from submit import Submitter
+from manifest_stream import ManifestStreamFeed
+from wallet_tx_stream import WalletTxStream
+from whirlpool_stream import PoolPriceFeed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("makerator")
@@ -271,7 +281,8 @@ async def run(args):
     config = Config()
     if args.entry_z is not None:
         config.entry_zscore = args.entry_z
-    config.price_poll_interval = float(args.tick_interval)
+    if args.signal_resample_secs is not None:
+        config.signal_resample_secs = float(args.signal_resample_secs)
     if not hasattr(config, "quote_size_sol"):
         config.quote_size_sol = float(args.quote_size_sol)
     config.requote_threshold_bps = float(args.requote_bps)
@@ -279,14 +290,13 @@ async def run(args):
 
     logger.info(f"mode={'LIVE' if args.live else 'DRY-RUN'}  "
                 f"entry_z={config.entry_zscore}  ttl={config.order_ttl_seconds}s  "
-                f"requote_thresh={config.requote_threshold_bps}bp")
+                f"requote_thresh={config.requote_threshold_bps}bp  "
+                f"resample={config.signal_resample_secs}s  "
+                f"ttl_timer={args.ttl_timer_secs}s")
 
-    sigs = SignalGenerator(config, scanner_db_path=args.scanner_db, db=None)
+    db = Database(args.db) if args.db else None
+    sigs = SignalGenerator(config, scanner_db_path=args.scanner_db, db=db)
     sigs.load_baskets()
-
-    feed = JupiterPriceFeed(config, set(quoter.MANIFEST_LST_SOL_MARKETS.keys()))
-    if sigs.monitored_mints:
-        feed.update_mints(sigs.monitored_mints)
 
     order_mgr = orders.OrderManager(config)
 
@@ -303,104 +313,218 @@ async def run(args):
             if input("LIVE mode — really? [y/N] ").strip().lower() != "y":
                 return
     elif args.bootstrap_pubkey:
-        # Dry-run can still bootstrap to observe (but never submits)
         payer_pubkey = Pubkey.from_string(args.bootstrap_pubkey)
         logger.info(f"dry-run with bootstrap from {payer_pubkey}")
 
-    # Bootstrap open orders from chain so a restart doesn't lose track of
-    # orders we placed in a previous run.
+    # ── Shared mutable book state, updated by the gRPC stream consumer ─────
+    book_tobs: Dict[str, quoter.TopOfBook] = {}
+    book_live_seqs: Dict[Tuple[str, str], Set[int]] = {}
+    book_headers: Dict[str, manifest.MarketHeader] = {}
+
+    # Initial sync via one RPC call so eval has state on first event.
+    initial_data = fetch_market_accounts(args.rpc)
+    init_tobs, init_seqs, init_headers = derive_book_state(initial_data)
+    book_tobs.update(init_tobs)
+    book_live_seqs.update(init_seqs)
+    book_headers.update(init_headers)
+    logger.info(f"initial book sync: {len(book_headers)} markets")
+
+    # Bootstrap our open orders from chain.
     if payer_pubkey is not None:
-        boot_data = fetch_market_accounts(args.rpc)
-        _, _, boot_headers = derive_book_state(boot_data)
-        bootstrapped = bootstrap_open_orders(boot_data, boot_headers, payer_pubkey)
+        bootstrapped = bootstrap_open_orders(initial_data, book_headers, payer_pubkey)
         for o in bootstrapped:
             order_mgr.open_orders[o.sequence_number] = o
         logger.info(f"bootstrap: recovered {len(bootstrapped)} open orders from chain")
         for o in bootstrapped:
             logger.info(f"  {o.market_label:>14s} {o.side:>3s} {o.size_base:.4f} "
-                        f"@ {o.price:.9f} seq={o.sequence_number} hint={o.order_index_hint}")
+                        f"@ {o.price:.9f} seq={o.sequence_number}")
 
-    tick = 0
-    async for prices in feed.poll():
-        tick += 1
-        sigs.token_prices.update(prices)
-        sigs.sol_usd_price = feed.sol_usd_price
+    # Seed the signal generator's prices with the initial midpoints so the
+    # first eval has something to work with. (Subsequent updates push deltas.)
+    initial_prices: Dict[str, float] = {}
+    for mint, market in quoter.MANIFEST_LST_SOL_MARKETS.items():
+        tob = book_tobs.get(str(market))
+        if tob and tob.best_bid and tob.best_ask:
+            initial_prices[mint] = (tob.best_bid + tob.best_ask) / 2.0
+    if initial_prices:
+        sigs.process_prices(initial_prices, time.time())
 
-        emitted = sigs.process_prices(prices, time.time())
-        manifest_lsts = set(quoter.MANIFEST_LST_SOL_MARKETS.keys())
-        actionable = [s for s in emitted
-                      if s.basket_size == 2 and all(m in manifest_lsts for m in s.mints)]
+    eval_lock = asyncio.Lock()
+    eval_count = [0]
+    submit_lock = asyncio.Lock()  # serialize concurrent submit attempts
 
-        market_data = fetch_market_accounts(args.rpc)
-        tobs, live_seqs, headers = derive_book_state(market_data)
-        intents = quoter.decide_quotes(config, actionable, tobs)
-        result = order_mgr.reconcile(intents, live_seqs)
+    async def submit_actions(by_market):
+        bh = rpc_call(args.rpc, "getLatestBlockhash", [{"commitment": "processed"}])
+        blockhash = bh["result"]["value"]["blockhash"]
+        for market, (cancels, places) in by_market.items():
+            for c in cancels:
+                order_mgr.register_cancelled(c.sequence_number)
+            tx_bytes, sig = build_batch_update_tx(
+                payer_kp, market, cancels, places, book_headers, blockhash,
+            )
+            logger.info(f"  TX {market}: cancels={len(cancels)} places={len(places)} "
+                        f"size={len(tx_bytes)}B sig={sig[:16]}...")
+            relay_sig = submitter.submit(tx_bytes, urgency="normal")
+            if relay_sig is None:
+                logger.error(f"  submit failed for {market}")
+                continue
+            if not confirm_signature(args.rpc, sig, deadline_s=20):
+                logger.error(f"  not confirmed: {sig}")
+                continue
+            ret_data = fetch_program_return(args.rpc, sig, deadline_s=15)
+            placed_keys = manifest.parse_batch_update_return(ret_data or b"")
+            if len(placed_keys) != len(places):
+                logger.warning(f"  expected {len(places)} placed, return has "
+                               f"{len(placed_keys)} — check parse")
+            for pa, (seq, hint) in zip(places, placed_keys):
+                order_mgr.register_placed(pa.intent, seq, hint)
+                logger.info(f"  ✓ placed seq={seq} hint={hint} "
+                            f"({pa.intent.market_label} {pa.intent.side})")
 
-        logger.info(
-            f"tick {tick}  signals={len(emitted)}/actionable={len(actionable)}  "
-            f"open={order_mgr.open_count()}  intents={len(intents)}  "
-            f"actions: place={len(result.places)} cancel={len(result.cancels)} "
-            f"kept={result.kept} cleaned={len(result.cleaned_from_book)}"
-        )
-        for c in result.cancels:
-            logger.info(f"  CANCEL {c.market_label:>14s}  seq={c.sequence_number}  "
-                        f"reason={c.reason.value}")
-        for p in result.places:
-            it = p.intent
-            logger.info(f"  PLACE  {it.market_label:>14s} {it.side:>3s} "
-                        f"{it.size_base:.4f} @ {it.price:.9f}  ({it.pair_label})")
+    async def evaluate(reason: str):
+        async with eval_lock:
+            eval_count[0] += 1
+            now = time.time()
+            # Fresh prices snapshot from current book midpoints.
+            prices: Dict[str, float] = {}
+            for mint, market in quoter.MANIFEST_LST_SOL_MARKETS.items():
+                tob = book_tobs.get(str(market))
+                if tob and tob.best_bid and tob.best_ask:
+                    prices[mint] = (tob.best_bid + tob.best_ask) / 2.0
 
-        # Group + dispatch
-        by_market = group_actions_by_market(result.cancels, result.places)
-        if by_market and args.live:
-            assert payer_kp and submitter
-            bh = rpc_call(args.rpc, "getLatestBlockhash", [{"commitment": "processed"}])
-            blockhash = bh["result"]["value"]["blockhash"]
+            emitted = sigs.process_prices(prices, now)
+            manifest_lsts = set(quoter.MANIFEST_LST_SOL_MARKETS.keys())
+            actionable = [s for s in emitted
+                          if s.basket_size == 2 and all(m in manifest_lsts for m in s.mints)]
+            intents = quoter.decide_quotes(config, actionable, book_tobs)
+            result = order_mgr.reconcile(intents, book_live_seqs, now=now)
 
-            for market, (cancels, places) in by_market.items():
-                # Pre-mark cancels so cleanup doesn't double-count
-                for c in cancels:
-                    order_mgr.register_cancelled(c.sequence_number)
-                tx_bytes, sig = build_batch_update_tx(
-                    payer_kp, market, cancels, places, headers, blockhash,
+            if intents or result.cancels or result.places or eval_count[0] % 50 == 0:
+                logger.info(
+                    f"eval#{eval_count[0]} ({reason})  "
+                    f"signals={len(emitted)}/actionable={len(actionable)} "
+                    f"open={order_mgr.open_count()} intents={len(intents)} "
+                    f"place={len(result.places)} cancel={len(result.cancels)} "
+                    f"kept={result.kept} cleaned={len(result.cleaned_from_book)}"
                 )
-                logger.info(f"  TX {market}: cancels={len(cancels)} places={len(places)} "
-                            f"size={len(tx_bytes)}B sig={sig[:16]}...")
-                relay_sig = submitter.submit(tx_bytes, urgency="normal")
-                if relay_sig is None:
-                    logger.error(f"  submit failed for {market}")
-                    continue
-                if not confirm_signature(args.rpc, sig, deadline_s=20):
-                    logger.error(f"  not confirmed: {sig}")
-                    continue
-                # Fetch return data → register placed orders
-                ret_data = fetch_program_return(args.rpc, sig, deadline_s=15)
-                placed_keys = manifest.parse_batch_update_return(ret_data or b"")
-                if len(placed_keys) != len(places):
-                    logger.warning(f"  expected {len(places)} placed, return data has "
-                                   f"{len(placed_keys)} entries — check parse")
-                for pa, (seq, hint) in zip(places, placed_keys):
-                    order_mgr.register_placed(pa.intent, seq, hint)
-                    logger.info(f"  ✓ placed seq={seq} hint={hint} "
-                                f"({pa.intent.market_label} {pa.intent.side})")
+            for c in result.cancels:
+                logger.info(f"  CANCEL {c.market_label:>14s}  seq={c.sequence_number}  "
+                            f"reason={c.reason.value}")
+            for p in result.places:
+                it = p.intent
+                logger.info(f"  PLACE  {it.market_label:>14s} {it.side:>3s} "
+                            f"{it.size_base:.4f} @ {it.price:.9f}  ({it.pair_label})")
 
-        if args.ticks and tick >= args.ticks:
-            break
+            by_market = group_actions_by_market(result.cancels, result.places)
+            if by_market and args.live and payer_kp and submitter:
+                async with submit_lock:
+                    await submit_actions(by_market)
 
-    logger.info(f"done: {tick} ticks. final open_orders={order_mgr.open_count()}")
+    # ── Concurrent listeners ────────────────────────────────────────────────
+
+    async def book_listener():
+        feed = ManifestStreamFeed()
+        async for upd in feed.stream():
+            try:
+                # Re-parse: tree roots may have moved; need fresh header.
+                h = manifest.parse_market_header(upd.raw_data)
+                book_headers[upd.market_pubkey] = h
+                book_live_seqs[(upd.market_pubkey, "bid")] = {
+                    o.sequence_number
+                    for o in manifest.walk_orders_inorder(upd.raw_data, h.bids_root)
+                }
+                book_live_seqs[(upd.market_pubkey, "ask")] = {
+                    o.sequence_number
+                    for o in manifest.walk_orders_inorder(upd.raw_data, h.asks_root)
+                }
+                book_tobs[upd.market_pubkey] = quoter.TopOfBook(
+                    best_bid=upd.best_bid, best_ask=upd.best_ask,
+                    best_bid_size=upd.best_bid_size, best_ask_size=upd.best_ask_size,
+                )
+            except Exception as e:
+                logger.exception(f"book_listener failed to update state: {e}")
+                continue
+            await evaluate(f"book {quoter.LST_SYMBOLS.get(upd.base_mint, upd.base_mint[:6])} slot={upd.slot}")
+
+    async def fill_listener():
+        if payer_pubkey is None:
+            return
+        feed = WalletTxStream(str(payer_pubkey))
+        async for tx in feed.stream():
+            await evaluate(f"wallet tx {tx.signature[:8]}{'(err)' if tx.err else ''} slot={tx.slot}")
+
+    async def pool_listener():
+        """Subscribe to off-Manifest pool accounts (Whirlpool / Raydium /
+        Meteora / etc.) for ALL 10 LSTs. Every swap on those pools rewrites
+        the account → instant price update → z-score recompute. Cross-LST
+        pools (mSOL/jitoSOL, bSOL/mSOL, jupSOL/jitoSOL Whirlpool) are the
+        highest-volume LST liquidity venues; this is where most fills happen."""
+        from constants import (
+            SOL_MINT, BSOL_MINT, MSOL_MINT, JITOSOL_MINT, JUPSOL_MINT,
+            INF_MINT, VSOL_MINT, DSOL_MINT, EDGESOL_MINT, BONKSOL_MINT,
+        )
+        from direct_swap import DEX_MANIFEST
+        pf_config = type("PFCfg", (), {})()
+        pf_config.grpc_endpoint = os.getenv('GRPC_ENDPOINT', '')
+        pf_config.grpc_token = os.getenv('GRPC_TOKEN', '')
+        pf_config.rpc_url = args.rpc
+        all_lsts = {
+            SOL_MINT, BSOL_MINT, MSOL_MINT, JITOSOL_MINT, JUPSOL_MINT,
+            INF_MINT, VSOL_MINT, DSOL_MINT, EDGESOL_MINT, BONKSOL_MINT,
+        }
+        # Exclude Manifest — book_listener already streams those market accounts
+        # AND gives us the raw RB tree (which PoolPriceFeed's ManifestDecoder doesn't).
+        feed = PoolPriceFeed(pf_config, all_lsts, exclude_dexes={DEX_MANIFEST})
+        if not feed.decoders:
+            logger.info("pool_listener: no matching pools — disabled")
+            return
+        async for prices in feed.stream():
+            sigs.token_prices.update({m: p for m, p in prices.items() if p > 0})
+            mints_str = ",".join(quoter.LST_SYMBOLS.get(m, m[:6]) for m in prices)
+            await evaluate(f"pool tick {mints_str}")
+
+    async def ttl_timer():
+        while True:
+            await asyncio.sleep(float(args.ttl_timer_secs))
+            await evaluate("ttl-timer")
+
+    tasks = [asyncio.create_task(book_listener()),
+             asyncio.create_task(pool_listener()),
+             asyncio.create_task(ttl_timer())]
+    if payer_pubkey is not None:
+        tasks.append(asyncio.create_task(fill_listener()))
+
+    if args.runtime_secs > 0:
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=args.runtime_secs)
+        except asyncio.TimeoutError:
+            for t in tasks:
+                t.cancel()
+            logger.info(f"runtime budget reached ({args.runtime_secs}s) — stopping")
+    else:
+        await asyncio.gather(*tasks)
+
+    logger.info(f"done. evals={eval_count[0]}  open_orders={order_mgr.open_count()}")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ticks", type=int, default=0,
-                    help="Stop after N ticks (0 = run forever)")
-    ap.add_argument("--tick-interval", type=float, default=6.0)
+    ap.add_argument("--runtime-secs", type=int, default=0,
+                    help="Stop after N wall-clock seconds (0 = forever)")
+    ap.add_argument("--ttl-timer-secs", type=float, default=5.0,
+                    help="How often to fire ttl-driven re-eval when book is quiet")
     ap.add_argument("--entry-z", type=float, default=None,
                     help="Override config.entry_zscore (default 2.5 from config.py)")
     ap.add_argument("--ttl", type=float, default=60.0, help="order_ttl_seconds")
     ap.add_argument("--requote-bps", type=float, default=2.0)
     ap.add_argument("--quote-size-sol", type=float, default=0.5)
     ap.add_argument("--scanner-db", default=os.getenv("SCANNER_DB", "../arbitrage_tracker/arb_tracker.db"))
+    ap.add_argument("--db", default=os.getenv("MAKERATOR_DB", "makerator.db"),
+                    help="Local DB for candle warmup restore + state. "
+                         "Populate with build_candles_from_cache.py first.")
+    ap.add_argument("--signal-resample-secs", type=float, default=None,
+                    help="Override config.signal_resample_secs (default 300). "
+                         "Set to 30 if candle DB built with --interval 30.")
     ap.add_argument("--rpc", default=os.getenv("SOLANA_RPC_URL"))
     ap.add_argument("--keypair", default=os.getenv("KEYPAIR_FILE", "/home/ubuntu/leeroy-mainnet.json"))
     ap.add_argument("--live", action="store_true",

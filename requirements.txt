@@ -5,6 +5,10 @@ solana>=0.30.0,<1.0.0
 solders>=0.18.0,<1.0.0
 base58>=2.1.0,<3.0.0
 
+# gRPC (Yellowstone Geyser streaming)
+grpcio>=1.50.0,<2.0.0
+protobuf>=4.21.0,<7.0.0
+
 # Utilities
 python-dotenv>=1.0.0,<2.0.0
 aiohttp>=3.8.0,<4.0.0
