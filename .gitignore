@@ -23,9 +23,10 @@ leeroy-mainnet.json
 venv/
 env/
 
-# Editor
+# Editor / agent
 .vscode/
 .idea/
+.claude/
 
 # Build / packaging
 build/
